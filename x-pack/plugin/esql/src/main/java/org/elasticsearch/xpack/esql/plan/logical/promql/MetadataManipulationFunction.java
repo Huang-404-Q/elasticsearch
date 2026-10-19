@@ -12,28 +12,39 @@ import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToString;
 import org.elasticsearch.xpack.esql.expression.function.scalar.nulls.Coalesce;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.Concat;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesGet;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesUnset;
+import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlBuiltinFunctionDefinitions;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.expression.promql.function.RegexExpand;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
-import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.supportTimeSeriesMetadataType;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.finite;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.open;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.union;
 
 /**
@@ -100,7 +111,10 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
         List<Expression> params = parameters();
         List<String> labels = new ArrayList<>();
         if (definition() == PromqlBuiltinFunctionDefinitions.LABEL_REPLACE) {
-            labels.add(literalString(params.get(2)));
+            String source = literalString(params.get(2));
+            if (source.isEmpty() == false) {
+                labels.add(source);
+            }
         } else {
             for (int i = 2; i < params.size(); i++) {
                 labels.add(literalString(params.get(i)));
@@ -132,10 +146,22 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
 
     @Override
     public List<Attribute> output() {
-        // The destination label is materialized during translation as a derived column exposed to the enclosing
-        // aggregation, so at the logical level the label set is that of the child; the derived label is surfaced only
-        // once translation runs.
-        return child().output();
+        List<Attribute> labels = child().output();
+        if (PromqlLabels.hasTsMetadata(labels)) {
+            return labels;
+        }
+        // A finite input remains finite. Its destination must survive even without an enclosing BY naming it.
+        var output = new ArrayList<>(labels);
+        output.removeIf(label -> PromqlLabels.labelName(label).equals(PromqlLabels.labelName(destination)));
+        output.add(destination);
+        return output;
+    }
+
+    @Override
+    public Map<String, DataType> labelTypes() {
+        var types = new HashMap<>(PromqlPlan.labelTypes(child()));
+        types.put(PromqlLabels.labelName(destination), destination.dataType());
+        return Map.copyOf(types);
     }
 
     @Override
@@ -159,17 +185,25 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      * {@code by(...)} aggregation groups on it exactly as it would on a stored label. The derived label shadows a stored
      * label of the same name: any such stored column is projected away so a lookup by name binds to the derived one.
      * <p>
-     * Because ES|QL treats {@code null} and {@code ""} as distinct grouping keys while Prometheus treats an absent label
-     * and an empty label value alike, every "label absent" outcome is normalized to {@code ""}: an absent source is
-     * coalesced to {@code ""} before matching, and {@code label_replace}'s no-match ({@code null}) is coalesced back to
-     * {@code ""}. All such series therefore fall into the same group, matching Prometheus.
+     * Absent sources are read as empty strings, as PromQL requires when matching or joining labels. The typed path
+     * normalizes an empty destination to {@code null}, matching the representation of absent promoted source labels.
+     * The legacy path retains its empty-string grouping convention.
      */
     @Override
     public IntermediateResult translate(TranslationContext context) {
         // The child must expose the labels the derivation reads, on top of whatever the enclosing translation requires.
         TranslationSchema childRequired = union(context.required(), finite(sourceLabels()));
-        IntermediateResult child = context.withRequired(childRequired).translate(child());
-        if (child.kind().constant) {
+        if (supportTimeSeriesMetadataType(context) && PromqlLabels.hasTsMetadata(child().output())) {
+            // Relabeling changes each input series before the parent groups it; equal sample values must not
+            // collapse merely because the parent only requests a subset of the input labels.
+            childRequired = union(childRequired, open());
+        }
+        // Finish the vector before rewriting its labels. This also materializes a constant vector's evaluation
+        // steps without making it depend on source documents, and leaves an empty source empty.
+        IntermediateResult child = supportTimeSeriesMetadataType(context)
+            ? context.withRequired(childRequired).translateIntermediate(child(), context.stepAttr().id(), new NameId())
+            : context.withRequired(childRequired).translate(child());
+        if (skipFunctionTranslation(context, child)) {
             return child;
         }
 
@@ -184,28 +218,54 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
         Expression destinationValue = definition() == PromqlBuiltinFunctionDefinitions.LABEL_REPLACE
             ? labelReplaceValue(context, source, aggregated)
             : labelJoinValue(context, source, aggregated);
+        if (supportTimeSeriesMetadataType(context)) {
+            destinationValue = new Case(
+                source,
+                new Equals(source, destinationValue, Literal.keyword(source, "")),
+                List.of(new Literal(source, null, DataType.KEYWORD), destinationValue)
+            );
+        }
 
-        String name = TranslationContext.mapFinite(destination);
-        Alias derived = new Alias(source, destination.name(), destinationValue, destination.id());
-        LogicalPlan plan = new Eval(context.cmd().source(), aggregated.plan(), List.of(derived));
+        Alias derived = new Alias(
+            source,
+            supportTimeSeriesMetadataType(context) ? TemporaryNameGenerator.locallyUniqueTemporaryName("label") : destination.name(),
+            destinationValue,
+            destination.id()
+        );
+        String name = PromqlLabels.labelName(destination);
+        var definitions = new ArrayList<Alias>();
+        definitions.add(derived);
+        if (supportTimeSeriesMetadataType(context)) {
+            var excluded = aggregated.schema().labelsInMetadata(Set.of(name));
+            if (excluded.isEmpty() == false) {
+                var metadata = new TimeSeriesUnset(source, aggregated.metadata(), List.of(Literal.keyword(source, name)));
+                definitions.add(new Alias(source, MetadataAttribute.TIMESERIES, metadata));
+            }
+        }
+        LogicalPlan plan = new Eval(source, aggregated.plan(), definitions);
         var unshadowed = new ArrayList<NamedExpression>();
+        Attribute previous = aggregated.labelBindings() != null ? aggregated.labelColumn(name) : null;
         for (Attribute attribute : plan.output()) {
-            if (attribute.id().equals(derived.id()) || TranslationContext.mapFinite(attribute).equals(name) == false) {
+            boolean shadowed = aggregated.labelBindings() != null
+                ? previous != null && attribute.id().equals(previous.id())
+                : PromqlLabels.labelName(attribute).equals(name);
+            if (attribute.id().equals(derived.id()) || shadowed == false) {
                 unshadowed.add(attribute);
             }
         }
         if (unshadowed.size() < plan.output().size()) {
-            plan = new Project(context.cmd().source(), plan, unshadowed);
+            plan = new Project(source, plan, unshadowed);
         }
-        TranslationSchema schema = union(aggregated.schema(), finite(List.of(name)));
-        return new IntermediateResult(
-            plan,
-            schema,
-            aggregated.value(),
-            aggregated.step(),
-            aggregated.pendingFilter(),
-            Kind.AFTER_INITIAL_AGGREGATE
-        );
+        var schema = union(aggregated.schema(), finite(List.of(name)));
+        IntermediateResult result;
+        if (aggregated.labelBindings() != null) {
+            var bindings = new HashMap<>(aggregated.labelBindings());
+            bindings.put(name, derived.toAttribute());
+            result = aggregated.with(plan, schema, aggregated.value(), bindings);
+        } else {
+            result = aggregated.with(plan, schema, aggregated.value());
+        }
+        return supportTimeSeriesMetadataType(context) ? PromqlPlan.checkUnique(source, result) : result;
     }
 
     /**
@@ -224,7 +284,7 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
         Expression replacement = params.get(1);
         Expression src = sourceLabelValue(context, source, table, srcLabel);
         Expression extracted = new RegexExpand(source, src, regex, replacement);
-        Expression existingDst = sourceLabelValue(context, source, table, TranslationContext.mapFinite(destination()));
+        Expression existingDst = sourceLabelValue(context, source, table, PromqlLabels.labelName(destination()));
         return new Coalesce(source, extracted, List.of(existingDst));
     }
 
@@ -260,7 +320,20 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      * enclosing {@code by(dst)} requires is a name in the schema, never a column here, and cannot resolve to itself.
      */
     private Expression sourceLabelValue(TranslationContext context, Source source, IntermediateResult table, String labelName) {
-        Attribute label = table.label(labelName);
+        // label_replace permits an empty source name; it always reads an absent label, never a metadata key.
+        if (labelName.isEmpty()) {
+            return Literal.keyword(source, "");
+        }
+        Expression label;
+        if (supportTimeSeriesMetadataType(context)) {
+            label = table.labelColumn(labelName);
+            Attribute metadata = table.metadata();
+            if (label == null && metadata != null) {
+                label = new TimeSeriesGet(source, metadata, Literal.keyword(source, labelName));
+            }
+        } else {
+            label = table.label(labelName);
+        }
         if (label == null) {
             return Literal.keyword(source, "");
         }

@@ -46,6 +46,7 @@ import org.elasticsearch.compute.operator.HashAggregationOperator;
 import org.elasticsearch.compute.operator.HighlightConfig;
 import org.elasticsearch.compute.operator.HighlightOperator;
 import org.elasticsearch.compute.operator.InsertEmptyBucketsOperator;
+import org.elasticsearch.compute.operator.KeepMinimumOperator;
 import org.elasticsearch.compute.operator.LimitOperator;
 import org.elasticsearch.compute.operator.LocalSourceOperator;
 import org.elasticsearch.compute.operator.LocalSourceOperator.LocalSourceFactory;
@@ -202,6 +203,7 @@ import org.elasticsearch.xpack.esql.plan.physical.HashJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.HighlightExec;
 import org.elasticsearch.xpack.esql.plan.physical.InsertEmptyBucketsExec;
 import org.elasticsearch.xpack.esql.plan.physical.IpLocationExec;
+import org.elasticsearch.xpack.esql.plan.physical.KeepMinimumExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitByExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
@@ -516,6 +518,8 @@ public class LocalExecutionPlanner {
             return planHashJoin(join, context);
         } else if (node instanceof DistinctByExec distinctBy) {
             return planDistinctBy(distinctBy, context);
+        } else if (node instanceof KeepMinimumExec keep) {
+            return planKeepMinimum(keep, context);
         } else if (node instanceof LookupJoinExec join) {
             return planLookupJoin(join, context);
         }
@@ -1767,14 +1771,33 @@ public class LocalExecutionPlanner {
         return source.with(new ProjectOperatorFactory(projection), layout);
     }
 
+    private PhysicalOperation planKeepMinimum(KeepMinimumExec keep, LocalExecutionPlannerContext context) {
+        PhysicalOperation source = plan(keep.child(), context);
+        var key = source.layout.get(keep.key().id());
+        var priority = source.layout.get(keep.priority().id());
+        if (key == null
+            || priority == null
+            || PlannerUtils.toElementType(key.type()) != ElementType.BYTES_REF
+            || PlannerUtils.toElementType(priority.type()) != ElementType.INT) {
+            throw new IllegalStateException("Minimum-priority selection requires a byte key and integer priority");
+        }
+        return source.with(new KeepMinimumOperator.Factory(key.channel(), priority.channel()), source.layout);
+    }
+
     private PhysicalOperation planDistinctBy(DistinctByExec distinctBy, LocalExecutionPlannerContext context) {
         PhysicalOperation source = plan(distinctBy.child(), context);
         var key = source.layout.get(distinctBy.key().id());
-        if (key == null || PlannerUtils.toElementType(key.type()) != ElementType.INT) {
-            throw new IllegalStateException("distinct-by requires non-null integer key, got [" + distinctBy.key() + "]");
+        if (key == null) {
+            throw new IllegalStateException("cannot find distinct-by key [" + distinctBy.key() + "]");
         }
-
-        return source.with(new DistinctByOperator.OrdinalIntKeyFactory(key.channel(), distinctBy.failOnDuplicate()), source.layout);
+        OperatorFactory factory = switch (PlannerUtils.toElementType(key.type())) {
+            case INT -> new DistinctByOperator.OrdinalIntKeyFactory(key.channel(), distinctBy.failOnDuplicate());
+            case BYTES_REF -> distinctBy.failOnDuplicate()
+                ? new DistinctByOperator.FullInputBytesRefKeyFactory(key.channel())
+                : new DistinctByOperator.BytesRefKeyFactory(key.channel());
+            default -> throw new IllegalStateException("unsupported distinct-by key [" + distinctBy.key() + "]");
+        };
+        return source.with(factory, source.layout);
     }
 
     private PhysicalOperation planLookupJoin(LookupJoinExec join, LocalExecutionPlannerContext context) {

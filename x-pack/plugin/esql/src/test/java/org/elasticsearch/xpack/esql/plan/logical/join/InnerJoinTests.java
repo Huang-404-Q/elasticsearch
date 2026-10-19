@@ -7,23 +7,33 @@
 
 package org.elasticsearch.xpack.esql.plan.logical.join;
 
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.compute.data.Page;
+import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.index.IndexProperties;
+import org.elasticsearch.xpack.esql.optimizer.LogicalPlanOptimizer;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.promql.CheckSeriesUniqueness;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.as;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.getFieldAttribute;
+import static org.elasticsearch.xpack.esql.EsqlTestUtils.unboundLogicalOptimizerContext;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
@@ -111,6 +121,93 @@ public class InnerJoinTests extends ESTestCase {
         assertThat(rebuilt.rightFields(), equalTo(innerJoin.rightFields()));
         assertThat(rebuilt.addedFields(), equalTo(innerJoin.addedFields()));
         assertThat(rebuilt.unique(), is(innerJoin.unique()));
+    }
+
+    public void testEmptyOperandDoesNotPruneEagerSiblingValidation() {
+        Attribute leftStep = new ReferenceAttribute(Source.EMPTY, "left_step", DataType.DATETIME);
+        Attribute leftKey = new ReferenceAttribute(Source.EMPTY, "left_key", DataType.KEYWORD);
+        Attribute rightStep = new ReferenceAttribute(Source.EMPTY, "right_step", DataType.DATETIME);
+        Attribute rightKey = new ReferenceAttribute(Source.EMPTY, "right_key", DataType.KEYWORD);
+        for (boolean emptyLeft : List.of(false, true)) {
+            for (boolean eager : List.of(false, true)) {
+                LogicalPlan left = emptyLeft
+                    ? new LocalRelation(Source.EMPTY, List.of(leftStep, leftKey), EmptyLocalSupplier.EMPTY)
+                    : checkedRelation(leftStep, leftKey);
+                LogicalPlan right = emptyLeft
+                    ? checkedRelation(rightStep, rightKey)
+                    : new LocalRelation(Source.EMPTY, List.of(rightStep, rightKey), EmptyLocalSupplier.EMPTY);
+                var join = new InnerJoin(Source.EMPTY, left, right, List.of(leftKey), List.of(rightKey), List.of(rightStep), false, eager);
+                LogicalPlan optimized = new LogicalPlanOptimizer(unboundLogicalOptimizerContext(TransportVersion.current())).optimize(join);
+                assertEquals(join.output(), optimized.output());
+                if (emptyLeft && eager == false) {
+                    assertTrue(as(optimized, LocalRelation.class).hasEmptySupplier());
+                } else {
+                    InnerJoin retained = as(optimized, InnerJoin.class);
+                    assertEquals(eager, retained.eager());
+                    LogicalPlan nonemptyOperand = emptyLeft ? retained.right() : retained.left();
+                    assertTrue(nonemptyOperand.anyMatch(CheckSeriesUniqueness.class::isInstance));
+                    assertTrue(nonemptyOperand.anyMatch(EsRelation.class::isInstance));
+                }
+            }
+        }
+    }
+
+    public void testEagerPolicySurvivesReconstructionAndMaterialization() {
+        FieldAttribute leftKey = getFieldAttribute("k", DataType.KEYWORD);
+        FieldAttribute rightKey = getFieldAttribute("k", DataType.KEYWORD);
+        for (boolean unique : List.of(false, true)) {
+            InnerJoin original = innerJoin(leftKey, rightKey, null, unique);
+            InnerJoin eager = new InnerJoin(
+                Source.EMPTY,
+                original.left(),
+                original.right(),
+                original.leftFields(),
+                original.rightFields(),
+                List.of(),
+                unique,
+                true
+            );
+            assertFalse(original.eager());
+            assertNotEquals(original, eager);
+            InnerJoin changedPolicy = as(original.transformPropertiesOnly(Boolean.class, ignored -> true), InnerJoin.class);
+            assertTrue(changedPolicy.unique());
+            assertTrue(changedPolicy.eager());
+            assertEquals(innerJoin(leftKey, rightKey, null, false), changedPolicy.transformPropertiesOnly(Boolean.class, ignored -> false));
+            InnerJoin renamed = as(
+                eager.transformExpressionsOnly(Attribute.class, attribute -> attribute.withName(attribute.name() + "_renamed")),
+                InnerJoin.class
+            );
+            assertTrue(renamed.eager());
+            assertEquals(unique, renamed.unique());
+            InnerJoin renamedDefault = as(
+                original.transformExpressionsOnly(Attribute.class, attribute -> attribute.withName(attribute.name() + "_renamed")),
+                InnerJoin.class
+            );
+            assertFalse(renamedDefault.eager());
+            assertEquals(unique, renamedDefault.unique());
+
+            InnerJoin.LogicalPlanTuple subPlan = InnerJoin.firstSubPlan(eager, new HashSet<>());
+            assertNotNull(subPlan);
+            var emptyResult = new LocalRelation(Source.EMPTY, List.of(rightKey), EmptyLocalSupplier.EMPTY);
+            InnerJoin materialized = as(InnerJoin.newMainPlan(eager, subPlan, emptyResult), InnerJoin.class);
+            assertTrue(materialized.eager());
+            assertEquals(unique, materialized.unique());
+            assertSame(eager.left(), materialized.left());
+            assertSame(emptyResult, materialized.right());
+        }
+    }
+
+    private static LogicalPlan checkedRelation(Attribute step, Attribute key) {
+        var relation = new EsRelation(
+            Source.EMPTY,
+            "metrics",
+            IndexMode.STANDARD,
+            Map.of("", List.of("metrics")),
+            Map.of("", List.of("metrics")),
+            Map.of("metrics", new IndexProperties(IndexMode.STANDARD, 1)),
+            List.of(step, key)
+        );
+        return new CheckSeriesUniqueness(Source.EMPTY, relation, step, key);
     }
 
     private static InnerJoin innerJoin(FieldAttribute leftKey, FieldAttribute rightKey, FieldAttribute addedValue, boolean unique) {

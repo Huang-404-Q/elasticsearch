@@ -267,6 +267,12 @@ public class In extends EsqlScalarFunction implements TranslationAware.SingleVal
 
     @Override
     protected TypeResolution resolveType() { // TODO: move the foldability check from QL's In to SQL's and remove this method
+        if (childrenResolved() == false) {
+            return new TypeResolution("Unresolved children");
+        }
+        if (children().stream().anyMatch(child -> child.dataType() == DataType.TIMESERIES_DATA_TYPE)) {
+            return new TypeResolution("[IN] does not support [_timeseries] values; use [TS_HASH] to compare time-series metadata");
+        }
         TypeResolution resolution = EsqlTypeResolutions.isExact(value, functionName(), DEFAULT);
         if (resolution.unresolved()) {
             return resolution;

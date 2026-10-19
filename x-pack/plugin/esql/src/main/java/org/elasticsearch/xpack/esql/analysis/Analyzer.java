@@ -1260,7 +1260,7 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
             if (plan instanceof PromqlCommand promql) {
                 return resolvePromql(promql, childrenOutput).transformDown(PromqlCommand.class, p -> {
                     Failures failures = new Failures();
-                    p.verify(failures, context.maxBranchCountPerMerge(), context.maxBranchCountPerMergeLimitSource());
+                    p.verify(failures, context);
                     if (failures.hasFailures()) {
                         throw new VerificationException(failures);
                     }
@@ -2067,8 +2067,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
                 return new MarkJoin(markJoin.source(), markJoin.left(), right, joinConfig, markJoin.markAttribute());
             }
             return subqueryJoin instanceof AntiJoin
-                ? new AntiJoin(subqueryJoin.source(), subqueryJoin.left(), right, joinConfig)
-                : new SemiJoin(subqueryJoin.source(), subqueryJoin.left(), right, joinConfig);
+                ? new AntiJoin(subqueryJoin.source(), subqueryJoin.left(), right, joinConfig, subqueryJoin.eager())
+                : new SemiJoin(subqueryJoin.source(), subqueryJoin.left(), right, joinConfig, subqueryJoin.eager());
         }
 
         private static List<Attribute> resolveRightFields(AbstractSubqueryJoin semiJoin) {

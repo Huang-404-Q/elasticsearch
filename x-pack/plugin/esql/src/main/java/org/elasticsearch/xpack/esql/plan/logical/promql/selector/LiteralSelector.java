@@ -14,6 +14,8 @@ import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PlaceholderRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlDataType;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext;
@@ -21,9 +23,11 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.Inter
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema;
 
+import java.util.Map;
 import java.util.Objects;
 
 import static java.util.Collections.emptyList;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.supportTimeSeriesMetadataType;
 
 /**
  * Represents a PromQL literal scalar value wrapped as a vector selector.
@@ -103,14 +107,26 @@ public final class LiteralSelector extends Selector {
     @Override
     public IntermediateResult translate(TranslationContext context) {
         LogicalPlan input = context.cmd().child();
-        LogicalPlan foldedPlan = PromqlLogicalPlanBuilder.tryFoldRelation(context.cmd(), input);
+        LogicalPlan foldedPlan = PromqlLogicalPlanBuilder.tryFoldRelation(context.cmd(), input, context.foldContext());
         Expression matcher = labelMatchers().predicate(source(), labels(), context.configuration());
+        Map<String, Attribute> bindings = supportTimeSeriesMetadataType(context) ? Map.of() : null;
 
         if (foldedPlan != null) {
             // a compile-time relation carries its own step column
             Attribute foldedStep = TranslationContext.find(foldedPlan.output(), context.cmd().stepColumnName());
-            return new IntermediateResult(foldedPlan, TranslationSchema.EMPTY, literal, foldedStep, matcher, Kind.CONSTANT);
+            Kind kind = bindings != null && foldedPlan instanceof LocalRelation local && local.supplier() == EmptyLocalSupplier.EMPTY
+                ? Kind.EMPTY
+                : Kind.CONSTANT;
+            return new IntermediateResult(foldedPlan, TranslationSchema.EMPTY, literal, foldedStep, matcher, kind, bindings);
         }
-        return new IntermediateResult(input, TranslationSchema.EMPTY, literal, context.stepAttr(), matcher);
+        return new IntermediateResult(
+            input,
+            TranslationSchema.EMPTY,
+            literal,
+            context.stepAttr(),
+            matcher,
+            Kind.BEFORE_INITIAL_AGGREGATE,
+            bindings
+        );
     }
 }

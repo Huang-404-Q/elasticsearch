@@ -313,7 +313,23 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
                 } else {
                     var unwrapped = Alias.unwrap(g);
                     if (unwrapped instanceof Attribute a) {
-                        addAttribute(g, a, firstPassAggs, secondPassGroupings, context, packDimensions, unpackDimensions, packPositions, i);
+                        if (a.semanticEquals(tsid.get())) {
+                            // _tsid is already a first-pass grouping. A VALUES alias would collide with its name
+                            // and be removed as an overridden aggregate, leaving the second pass with a missing input.
+                            secondPassGroupings.add(new Alias(g.source(), g.name(), tsid.get(), g.id()));
+                        } else {
+                            addAttribute(
+                                g,
+                                a,
+                                firstPassAggs,
+                                secondPassGroupings,
+                                context,
+                                packDimensions,
+                                unpackDimensions,
+                                packPositions,
+                                i
+                            );
+                        }
                     } else {
                         assert g instanceof Alias : "g must be an Alias at this point";
                         if (unwrapped instanceof Bucket bucket && bucket.field().dataType().isHistogram()) {

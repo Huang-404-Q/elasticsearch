@@ -35,6 +35,7 @@ public class InnerJoin extends Join implements SortPreserving {
 
     private final List<Attribute> addedFields;
     private final boolean unique;
+    private final boolean eager;
     private List<Attribute> lazyOutput;
 
     public InnerJoin(
@@ -46,9 +47,24 @@ public class InnerJoin extends Join implements SortPreserving {
         List<Attribute> addedFields,
         boolean unique
     ) {
+        this(source, left, right, leftFields, rightFields, addedFields, unique, false);
+    }
+
+    /** Creates an inner join with independent uniqueness and operand-evaluation policies. */
+    public InnerJoin(
+        Source source,
+        LogicalPlan left,
+        LogicalPlan right,
+        List<Attribute> leftFields,
+        List<Attribute> rightFields,
+        List<Attribute> addedFields,
+        boolean unique,
+        boolean eager
+    ) {
         super(source, left, right, JoinTypes.INNER, leftFields, rightFields, null, ExecuteLocation.COORDINATOR);
         this.addedFields = addedFields;
         this.unique = unique;
+        this.eager = eager;
     }
 
     @Override
@@ -75,6 +91,11 @@ public class InnerJoin extends Join implements SortPreserving {
 
     public boolean unique() {
         return unique;
+    }
+
+    @Override
+    public boolean eager() {
+        return eager;
     }
 
     @Override
@@ -136,12 +157,12 @@ public class InnerJoin extends Join implements SortPreserving {
 
     @Override
     public InnerJoin replaceChildren(LogicalPlan left, LogicalPlan right) {
-        return new InnerJoin(source(), left, right, leftFields(), rightFields(), addedFields, unique);
+        return new InnerJoin(source(), left, right, leftFields(), rightFields(), addedFields, unique, eager);
     }
 
     @Override
     protected NodeInfo<Join> info() {
-        return NodeInfo.create(this, InnerJoin::new, left(), right(), leftFields(), rightFields(), addedFields, unique);
+        return NodeInfo.create(this, InnerJoin::new, left(), right(), leftFields(), rightFields(), addedFields, unique, eager);
     }
 
     @Override
@@ -156,12 +177,12 @@ public class InnerJoin extends Join implements SortPreserving {
             return false;
         }
         InnerJoin innerJoin = (InnerJoin) o;
-        return unique == innerJoin.unique && addedFields.equals(innerJoin.addedFields);
+        return unique == innerJoin.unique && eager == innerJoin.eager && addedFields.equals(innerJoin.addedFields);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), addedFields, unique);
+        return Objects.hash(super.hashCode(), addedFields, unique, eager);
     }
 
     /**

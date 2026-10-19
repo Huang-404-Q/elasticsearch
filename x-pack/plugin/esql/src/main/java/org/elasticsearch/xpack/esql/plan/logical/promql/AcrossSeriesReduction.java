@@ -15,6 +15,7 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
@@ -22,6 +23,10 @@ import org.elasticsearch.xpack.esql.expression.Order;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToInteger;
 import org.elasticsearch.xpack.esql.expression.function.scalar.math.Floor;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesGet;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesHash;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesUnset;
+import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThanOrEqual;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.LessThan;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
@@ -29,19 +34,25 @@ import org.elasticsearch.xpack.esql.expression.promql.function.HashOffset;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlBuiltinFunctionDefinitions;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionRegistry.PromqlContext;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate.Grouping;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate.Grouping.WITHOUT;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.supportTimeSeriesMetadataType;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.finite;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.open;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.union;
@@ -100,6 +111,11 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
     }
 
     @Override
+    public Map<String, DataType> labelTypes() {
+        return PromqlPlan.labelTypes(child());
+    }
+
+    @Override
     public boolean equals(Object o) {
         if (super.equals(o)) {
             AcrossSeriesReduction that = (AcrossSeriesReduction) o;
@@ -132,7 +148,8 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
      */
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        if (grouping() == WITHOUT) {
+        boolean typedMetadata = supportTimeSeriesMetadataType(context);
+        if (grouping() == WITHOUT && typedMetadata == false) {
             throw new VerificationException("function [{}] is not yet supported with [{}]", functionName(), WITHOUT.name());
         }
 
@@ -140,17 +157,37 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         // by; the partition labels must be exposed to rank within them. limit_ratio is membership-neutral:
         // its sampling key is solely the input vector's identity, so outer partitions are neither required
         // from the child nor materialized below.
-        List<String> partitions = TranslationContext.mapFinite(groupings());
+        List<String> partitions = PromqlLabels.labelNames(groupings());
         boolean isLimitRatio = definition() == PromqlBuiltinFunctionDefinitions.LIMIT_RATIO;
-        TranslationSchema childRequired = isLimitRatio
+        TranslationSchema childRequired = isLimitRatio || grouping() == WITHOUT
             ? union(context.required(), open())
             : union(union(context.required(), open()), finite(partitions));
-        IntermediateResult childResult = context.withRequired(childRequired).translate(child());
-        if (childResult.kind().constant) {
+        TranslationContext childContext = context.withRequired(childRequired);
+        IntermediateResult childResult = typedMetadata
+            ? childContext.translateIntermediate(child(), new NameId(), new NameId())
+            : childContext.translate(child());
+        if (typedMetadata) {
+            // Reductions consume complete vectors, including source-independent constants and composed joins.
+            // Missing samples are absent from that vector and must not occupy a ranking slot.
+            childResult = childResult.with(
+                new Filter(source(), childResult.plan(), new IsNotNull(source(), childResult.value())),
+                childResult.schema(),
+                childResult.value()
+            );
+            if (isLimitRatio == false
+                && definition() != PromqlBuiltinFunctionDefinitions.LIMITK
+                && childResult.value().dataType().isHistogram()) {
+                // Ranking ignores histograms, but still evaluates and validates its argument.
+                return context.eval(
+                    childResult.with(new Drain(source(), childResult.plan()), childResult.schema(), childResult.value()),
+                    new Literal(source(), null, DataType.DOUBLE)
+                );
+            }
+        } else if (childResult.kind().constant) {
             if (isLimitRatio) {
                 // A constant vector's empty label set is a valid identity: sample it directly with an
                 // empty key set, without introducing an aggregation.
-                LogicalPlan sampled = emitLimitRatioFilter(childResult);
+                LogicalPlan sampled = emitLimitRatioFilter(context, childResult);
                 return childResult.with(sampled, childResult.schema(), childResult.value());
             }
             return childResult;
@@ -159,10 +196,17 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         var schema = isLimitRatio ? childResult.schema() : union(childResult.schema(), finite(partitions));
 
         var promqlCtx = new PromqlContext(context.time(), AggregateFunction.NO_WINDOW, childResult.step(), context.configuration());
-        IntermediateResult aggregated = childResult.kind().afterInitialAggregation
-            ? context.regroup(childResult, schema, false, childResult.value())
-            : context.collapse(childResult, schema, childResult.value());
-        LogicalPlan result = isLimitRatio ? emitLimitRatioFilter(aggregated) : emitTopNBy(context, aggregated, partitions, promqlCtx);
+        IntermediateResult aggregated;
+        if (typedMetadata) {
+            aggregated = childResult;
+        } else if (childResult.kind().afterInitialAggregation) {
+            aggregated = context.regroup(childResult, schema, false, childResult.value());
+        } else {
+            aggregated = context.collapse(childResult, schema, childResult.value());
+        }
+        LogicalPlan result = isLimitRatio
+            ? emitLimitRatioFilter(context, aggregated)
+            : emitTopNBy(context, aggregated, partitions, promqlCtx);
         return aggregated.with(result, aggregated.schema(), aggregated.value());
     }
 
@@ -173,6 +217,10 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         List<String> partitions,
         PromqlContext promqlContext
     ) {
+        if (supportTimeSeriesMetadataType(context) && ((Number) parameters().getFirst().fold(FoldContext.small())).doubleValue() < 1) {
+            // LIMIT 0 pruning must not discard duplicate-series validation in the reduction's argument.
+            return new Drain(source(), table.plan());
+        }
         ReductionGrouping grouping = reductionGrouping(context, table, partitions);
         var order = (Order) buildEsqlFunction(table.value(), promqlContext);
         // Prometheus converts k with an integer cast: `topk(1.5, v)` keeps one series, and a k below one keeps none.
@@ -185,12 +233,12 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
      * {@link Filter} over the internal {@link HashOffset} sampling offset, so no sort order is
      * built and no dedicated plan node or execution operator is needed. The sampling key is
      * membership-neutral: solely the input identity (the {@code _timeseries} blob at series
-     * grain, else the surviving grouping labels or packed label sets, with packing-covered
-     * labels dropped and the rest ordered by name so key order cannot change the hash).
+     * grain, else the surviving grouping labels or metadata columns, with labels already covered
+     * by metadata dropped and the rest ordered by name so key order cannot change the hash).
      * Outer {@code by} partition labels are neither hashed nor materialized as null columns. The filter sits
      * above the aggregation producing its keys, which the optimizer cannot push past.
      */
-    private LogicalPlan emitLimitRatioFilter(IntermediateResult table) {
+    private LogicalPlan emitLimitRatioFilter(TranslationContext context, IntermediateResult table) {
         // The sampling key is the input identity from below. At series grain that is the
         // _timeseries blob; over an aggregated input the rows are groups, so their own grain
         // labels are the key (for example pod and cluster groups for limit_ratio over sum by).
@@ -198,23 +246,26 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         // or dropped deterministically.
         List<Expression> keys = new ArrayList<>();
         Attribute series = table.plan().output().stream().filter(MetadataAttribute::isTimeSeriesAttribute).findFirst().orElse(null);
-        if (series != null) {
+        if (supportTimeSeriesMetadataType(context)) {
+            // Canonicalize residual metadata together with promoted labels: physical projection cannot affect sampling.
+            keys.add(PromqlPlan.seriesKey(table));
+        } else if (series != null) {
             addIfMissing(keys, series);
         } else {
             // No series blob: the rows are groups. Their identity is the concrete grouping
-            // underneath -- packed label sets when the schema packs labels away (for example
-            // sum without), else the grain label columns. Packings hold only dimensions, never
+            // underneath -- metadata columns when the schema carries labels in metadata (for example
+            // sum without), else the grain label columns. Metadata columns hold only dimensions, never
             // the step, so the identity is stable across steps.
             var resolvedSkips = new ArrayList<Set<String>>();
-            for (Set<String> skip : TranslationContext.finestFirst(table.schema().skips())) {
-                Attribute packing = table.packed(skip);
-                if (packing != null) {
-                    addIfMissing(keys, packing);
+            for (Set<String> skip : TranslationContext.coarse(table.schema().skips())) {
+                Attribute metadata = context.metadata(table, skip);
+                if (metadata != null) {
+                    addIfMissing(keys, metadata);
                     resolvedSkips.add(skip);
                 }
             }
-            // A finite label carried inside any packing adds no identity: the packing already
-            // determines it (for example pod inside _timeseries$region). The surviving labels
+            // A finite label carried inside metadata adds no identity: the metadata already
+            // determines it (for example pod inside metadata excluding region). The surviving labels
             // sort by name so grouping-key order cannot change the hashed bytes.
             table.schema()
                 .labels()
@@ -233,7 +284,9 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         Source source = source();
         if (Double.isNaN(ratio) || ratio == 0.0) {
             // No offset falls below zero (and NaN comparisons are always false): keep nothing.
-            return new Filter(source, table.plan(), Literal.FALSE);
+            return supportTimeSeriesMetadataType(context)
+                ? new Drain(source, table.plan())
+                : new Filter(source, table.plan(), Literal.FALSE);
         }
         if (ratio >= 1.0 || ratio <= -1.0) {
             // Every offset falls below ratios at or above one, and at or above the non-positive
@@ -262,13 +315,47 @@ public final class AcrossSeriesReduction extends PromqlFunctionCall {
         var groupings = new ArrayList<Expression>();
         groupings.add(table.step());
         LogicalPlan plan = table.plan();
-        if (grouping() == AcrossSeriesAggregate.Grouping.BY) {
+        if (supportTimeSeriesMetadataType(context) && grouping() != Grouping.NONE) {
+            var excluded = new TreeSet<String>();
+            Expression metadata = new Literal(source(), null, DataType.TIMESERIES_DATA_TYPE);
+            Set<String> labels = new TreeSet<>(partitions);
+            if (grouping() == WITHOUT) {
+                excluded.addAll(partitions);
+                excluded.add(LabelMatcher.NAME);
+                if (table.metadata() != null) {
+                    metadata = new TimeSeriesUnset(
+                        source(),
+                        table.metadata(),
+                        excluded.stream().map(name -> (Expression) Literal.keyword(source(), name)).toList()
+                    );
+                }
+                labels = new TreeSet<>(table.schema().labels());
+                labels.removeAll(excluded);
+            }
+            var values = new ArrayList<Expression>();
+            for (String name : labels) {
+                Literal label = Literal.keyword(source(), name);
+                Expression value = table.labelColumn(name);
+                if (value == null) {
+                    value = table.metadata() == null ? Literal.NULL : new TimeSeriesGet(source(), table.metadata(), label);
+                }
+                values.add(label);
+                values.add(value);
+            }
+            Alias key = new Alias(
+                source(),
+                TemporaryNameGenerator.locallyUniqueTemporaryName("partition"),
+                new TimeSeriesHash(source(), metadata, values)
+            );
+            plan = new Eval(source(), plan, List.of(key));
+            groupings.add(key.toAttribute());
+        } else if (grouping() == AcrossSeriesAggregate.Grouping.BY) {
             var nulls = new ArrayList<Alias>();
             for (String partition : partitions) {
                 Attribute carrier = table.label(partition);
                 if (carrier == null) {
                     // a partition label absent from every series ranks as one partition, like Prometheus
-                    nulls.add(TranslationContext.emitNullExpression(TranslationContext.mapToRef(partition)));
+                    nulls.add(TranslationContext.emitNullExpression(TranslationContext.stub(partition)));
                     carrier = nulls.getLast().toAttribute();
                 }
                 groupings.add(carrier);

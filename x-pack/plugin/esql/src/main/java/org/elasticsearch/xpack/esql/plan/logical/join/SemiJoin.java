@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.esql.plan.logical.join;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
@@ -26,29 +27,46 @@ import java.util.List;
 public class SemiJoin extends AbstractSubqueryJoin {
 
     public SemiJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config) {
-        super(source, left, right, config);
+        this(source, left, right, config, false);
+    }
+
+    /** Creates a semi join, optionally retaining evaluation of both operands even when the result is empty. */
+    public SemiJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config, boolean eager) {
+        super(source, left, right, config, eager);
         assert config.type() == JoinTypes.SEMI : "SemiJoin requires join type SEMI, got [" + config.type() + "]";
     }
 
     public SemiJoin(Source source, LogicalPlan left, LogicalPlan right, List<Attribute> leftFields, List<Attribute> rightFields) {
-        super(source, left, right, JoinTypes.SEMI, leftFields, rightFields);
+        this(source, left, right, leftFields, rightFields, false);
+    }
+
+    /** Creates a keyed semi join with an explicit operand-evaluation policy. */
+    public SemiJoin(
+        Source source,
+        LogicalPlan left,
+        LogicalPlan right,
+        List<Attribute> leftFields,
+        List<Attribute> rightFields,
+        boolean eager
+    ) {
+        super(source, left, right, JoinTypes.SEMI, leftFields, rightFields, eager);
     }
 
     @Override
     protected NodeInfo<Join> info() {
         JoinConfig config = config();
-        return NodeInfo.create(this, SemiJoin::new, left(), right(), config.leftFields(), config.rightFields());
+        return NodeInfo.create(this, SemiJoin::new, left(), right(), config.leftFields(), config.rightFields(), eager());
     }
 
     @Override
     public Join replaceChildren(LogicalPlan left, LogicalPlan right) {
-        return new SemiJoin(source(), left, right, config());
+        return new SemiJoin(source(), left, right, config(), eager());
     }
 
     @Override
     protected LogicalPlan buildEmptyRightSidePlan(Source source) {
-        // x IN () is FALSE for every row, so the left side never has to run.
-        return new LocalRelation(source, output(), EmptyLocalSupplier.EMPTY);
+        // Eager callers still need the probe's validations even though no row can match.
+        return eager() ? new Drain(source, left()) : new LocalRelation(source, output(), EmptyLocalSupplier.EMPTY);
     }
 
 }

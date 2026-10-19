@@ -126,7 +126,10 @@ import org.elasticsearch.xpack.esql.plan.QuerySettings;
 import org.elasticsearch.xpack.esql.plan.ResolvedSettings;
 import org.elasticsearch.xpack.esql.plan.logical.MetricsInfo;
 import org.elasticsearch.xpack.esql.plan.logical.inference.DenseVector;
+import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.promql.CheckSeriesUniqueness;
 import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EvalExec;
@@ -144,6 +147,7 @@ import org.elasticsearch.xpack.esql.plan.physical.inference.DenseVectorExec;
 import org.elasticsearch.xpack.esql.planner.mapper.Mapper;
 import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.elasticsearch.xpack.esql.session.Configuration;
+import org.elasticsearch.xpack.esql.session.Versioned;
 import org.elasticsearch.xpack.spatial.SpatialPlugin;
 import org.hamcrest.Matcher;
 import org.junit.After;
@@ -1142,6 +1146,109 @@ public class LocalExecutionPlannerTests extends MapperServiceTestCase {
                 }
             };
         };
+    }
+
+    public void testSeriesUniquenessUsesStepAndCompleteIdentity() throws IOException {
+        List<Page> results = runSeriesUniqueness(
+            seriesPage(new long[] { 10, 10 }, new String[] { "a", "b" }),
+            seriesPage(new long[] { 20 }, new String[] { "a" })
+        );
+        try {
+            assertEquals(3, results.stream().mapToInt(Page::getPositionCount).sum());
+            for (Page page : results) {
+                assertEquals(3, page.getBlockCount());
+                LongBlock step = page.getBlock(0);
+                LongBlock value = page.getBlock(2);
+                for (int position = 0; position < page.getPositionCount(); position++) {
+                    assertEquals(step.getLong(position) + 1, value.getLong(position));
+                }
+            }
+        } finally {
+            Releasables.close(results);
+        }
+    }
+
+    public void testSeriesUniquenessRejectsDuplicateAcrossPages() {
+        IllegalArgumentException failure = expectThrows(
+            IllegalArgumentException.class,
+            () -> runSeriesUniqueness(
+                seriesPage(new long[] { 10, 10 }, new String[] { "a", "b" }),
+                seriesPage(new long[] { 10 }, new String[] { "a" })
+            )
+        );
+        assertEquals("input must not have duplicates when [failOnDuplicate] set to [true]", failure.getMessage());
+    }
+
+    public void testSeriesUniquenessDoesNotSkipNullStep() {
+        var blockFactory = TestBlockFactory.getNonBreakingInstance();
+        Page page = new Page(
+            blockFactory.newConstantNullBlock(2),
+            blockFactory.newConstantBytesRefBlockWith(new BytesRef("a"), 2),
+            blockFactory.newConstantLongBlockWith(1, 2)
+        );
+        expectThrows(IllegalArgumentException.class, () -> runSeriesUniqueness(page));
+    }
+
+    public void testSeriesUniquenessRetainsMultivaluedStepBoundaries() throws IOException {
+        var blockFactory = TestBlockFactory.getNonBreakingInstance();
+        try (LongBlock.Builder steps = blockFactory.newLongBlockBuilder(3)) {
+            steps.beginPositionEntry().appendLong(1).appendLong(2).endPositionEntry();
+            steps.appendLong(1);
+            steps.appendLong(2);
+            Page page = new Page(
+                steps.build(),
+                blockFactory.newConstantBytesRefBlockWith(new BytesRef("a"), 3),
+                blockFactory.newConstantLongBlockWith(1, 3)
+            );
+            List<Page> results = runSeriesUniqueness(page);
+            try {
+                assertEquals(3, results.stream().mapToInt(Page::getPositionCount).sum());
+            } finally {
+                Releasables.close(results);
+            }
+        }
+    }
+
+    private List<Page> runSeriesUniqueness(Page... input) throws IOException {
+        var step = new ReferenceAttribute(Source.EMPTY, "step", DataType.DATETIME);
+        var identity = new ReferenceAttribute(Source.EMPTY, "identity", DataType.KEYWORD);
+        var value = new ReferenceAttribute(Source.EMPTY, "value", DataType.LONG);
+        var child = new LocalRelation(Source.EMPTY, List.of(step, identity, value), EmptyLocalSupplier.EMPTY);
+        var check = new CheckSeriesUniqueness(Source.EMPTY, child, step, identity);
+        PhysicalPlan physical = new Mapper().map(new Versioned<>(check, TransportVersion.current()));
+        var planned = planner().plan(
+            "test",
+            FoldContext.small(),
+            PlannerSettings.DEFAULTS,
+            physical,
+            EmptyIndexedByShardId.instance(),
+            randomBoolean()
+        );
+        assertEquals(1, planned.driverFactories.size());
+        var operation = planned.driverFactories.get(0).driverSupplier().physicalOperation();
+        assertTrue(
+            operation.intermediateOperatorFactories.stream()
+                .anyMatch(factory -> factory instanceof DistinctByOperator.FullInputBytesRefKeyFactory)
+        );
+        var blockFactory = TestBlockFactory.getNonBreakingInstance();
+        var context = new DriverContext(blockFactory.bigArrays(), blockFactory, null);
+        return new TestDriverRunner().builder(context)
+            .input(input)
+            .run(operation.intermediateOperatorFactories.toArray(Operator.OperatorFactory[]::new));
+    }
+
+    private static Page seriesPage(long[] steps, String[] identities) {
+        var blockFactory = TestBlockFactory.getNonBreakingInstance();
+        try (
+            BytesRefBlock.Builder identity = blockFactory.newBytesRefBlockBuilder(identities.length);
+            LongBlock.Builder values = blockFactory.newLongBlockBuilder(steps.length)
+        ) {
+            for (int i = 0; i < steps.length; i++) {
+                identity.appendBytesRef(new BytesRef(identities[i]));
+                values.appendLong(steps[i] + 1);
+            }
+            return new Page(blockFactory.newLongArrayVector(steps, steps.length).asBlock(), identity.build(), values.build());
+        }
     }
 
     public void testPlanInnerJoinManyToOne() throws IOException {

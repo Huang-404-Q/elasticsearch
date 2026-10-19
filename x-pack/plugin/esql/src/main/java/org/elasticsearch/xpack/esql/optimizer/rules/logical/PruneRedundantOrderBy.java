@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.optimizer.rules.logical;
 
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.OrderBy;
 import org.elasticsearch.xpack.esql.plan.logical.SortAgnostic;
@@ -35,7 +36,7 @@ import java.util.Set;
  * <p>
  * In most cases though, following commands can make the previous SORTs redundant,
  * because it will re-sort previously sorted results (eg. if there is another SORT)
- * or because the order will be scrambled by another command (eg. a STATS)
+ * or because the order will be scrambled by another command (eg. a STATS) or all rows will be discarded.
  * <p>
  * This rule finds and prunes redundant SORTs, attempting to make the plan executable.
  */
@@ -43,7 +44,7 @@ public class PruneRedundantOrderBy extends OptimizerRules.OptimizerRule<LogicalP
 
     @Override
     protected LogicalPlan rule(LogicalPlan plan) {
-        if (plan instanceof OrderBy || plan instanceof TopN || plan instanceof Aggregate) {
+        if (plan instanceof OrderBy || plan instanceof TopN || plan instanceof Aggregate || plan instanceof Drain) {
             Set<OrderBy> redundant = findRedundantSort(((UnaryPlan) plan).child());
             if (redundant.isEmpty()) {
                 return plan;

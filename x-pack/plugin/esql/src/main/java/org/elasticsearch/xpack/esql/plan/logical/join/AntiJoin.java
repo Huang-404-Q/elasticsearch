@@ -27,23 +27,40 @@ import java.util.List;
 public class AntiJoin extends AbstractSubqueryJoin {
 
     public AntiJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config) {
-        super(source, left, right, config);
+        this(source, left, right, config, false);
+    }
+
+    /** Creates an anti join, optionally retaining evaluation of both operands even when the result is empty. */
+    public AntiJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config, boolean eager) {
+        super(source, left, right, config, eager);
         assert config.type() == JoinTypes.ANTI : "AntiJoin requires join type ANTI, got [" + config.type() + "]";
     }
 
     public AntiJoin(Source source, LogicalPlan left, LogicalPlan right, List<Attribute> leftFields, List<Attribute> rightFields) {
-        super(source, left, right, JoinTypes.ANTI, leftFields, rightFields);
+        this(source, left, right, leftFields, rightFields, false);
+    }
+
+    /** Creates a keyed anti join with an explicit operand-evaluation policy. */
+    public AntiJoin(
+        Source source,
+        LogicalPlan left,
+        LogicalPlan right,
+        List<Attribute> leftFields,
+        List<Attribute> rightFields,
+        boolean eager
+    ) {
+        super(source, left, right, JoinTypes.ANTI, leftFields, rightFields, eager);
     }
 
     @Override
     protected NodeInfo<Join> info() {
         JoinConfig config = config();
-        return NodeInfo.create(this, AntiJoin::new, left(), right(), config.leftFields(), config.rightFields());
+        return NodeInfo.create(this, AntiJoin::new, left(), right(), config.leftFields(), config.rightFields(), eager());
     }
 
     @Override
     public Join replaceChildren(LogicalPlan left, LogicalPlan right) {
-        return new AntiJoin(source(), left, right, config());
+        return new AntiJoin(source(), left, right, config(), eager());
     }
 
     @Override

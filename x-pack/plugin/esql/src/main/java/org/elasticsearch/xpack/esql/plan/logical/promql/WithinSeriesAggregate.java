@@ -12,12 +12,18 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.FirstOverTime;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.LastOverTime;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Represents a PromQL aggregate function call that operates on range vectors.
@@ -67,6 +73,15 @@ public final class WithinSeriesAggregate extends PromqlFunctionCall {
     }
 
     @Override
+    public Map<String, DataType> labelTypes() {
+        var types = new HashMap<>(PromqlPlan.labelTypes(child()));
+        if (preservesMetricName() == false) {
+            types.remove(LabelMatcher.NAME);
+        }
+        return Map.copyOf(types);
+    }
+
+    @Override
     public FunctionType functionType() {
         return FunctionType.WITHIN_SERIES_AGGREGATION;
     }
@@ -79,6 +94,10 @@ public final class WithinSeriesAggregate extends PromqlFunctionCall {
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateValueFunction(context);
+        return preservesMetricName() ? translateValueFunction(context) : translateValueFunctionDroppingMetricName(context);
+    }
+
+    private boolean preservesMetricName() {
+        return definition() == LastOverTime.PROMQL_DEFINITION || definition() == FirstOverTime.PROMQL_DEFINITION;
     }
 }

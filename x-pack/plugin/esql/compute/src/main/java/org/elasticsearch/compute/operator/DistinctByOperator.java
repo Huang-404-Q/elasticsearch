@@ -11,6 +11,7 @@ import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.BitArray;
 import org.elasticsearch.common.util.BytesRefHashTable;
+import org.elasticsearch.common.util.ObjectArray;
 import org.elasticsearch.compute.aggregation.blockhash.HashImplFactory;
 import org.elasticsearch.compute.data.BlockFactory;
 import org.elasticsearch.compute.data.BytesRefBlock;
@@ -56,6 +57,22 @@ public final class DistinctByOperator extends AbstractPageMappingOperator {
                 + ", factory="
                 + this.getClass().getSimpleName()
                 + "]";
+        }
+    }
+
+    /** Checks every input page for duplicate byte keys before releasing any rows to downstream operators. */
+    public record FullInputBytesRefKeyFactory(int keyChannel) implements OperatorFactory {
+        @Override
+        public Operator get(DriverContext driverContext) {
+            return new UniquenessGuard(
+                new DistinctByOperator(keyChannel, new BytesRefFailOnDuplicateProcessor(keyChannel, driverContext)),
+                driverContext.bigArrays().withCircuitBreaking()
+            );
+        }
+
+        @Override
+        public String describe() {
+            return "UniquenessGuard[keyChannel=" + keyChannel + "]";
         }
     }
 
@@ -109,6 +126,106 @@ public final class DistinctByOperator extends AbstractPageMappingOperator {
     @Override
     public void close() {
         Releasables.close(processor, super::close);
+    }
+
+    /**
+     * A downstream LIMIT may stop its entire upstream pipeline as soon as it receives enough rows.
+     * Withhold output until the complete input has been checked so a later duplicate cannot be missed.
+     */
+    private static final class UniquenessGuard implements Operator {
+        private final DistinctByOperator delegate;
+        private final BigArrays bigArrays;
+        private ObjectArray<Page> pages;
+        private long readPosition;
+        private long writePosition;
+        private long rowsEmitted;
+
+        private UniquenessGuard(DistinctByOperator delegate, BigArrays bigArrays) {
+            this.delegate = delegate;
+            this.bigArrays = bigArrays;
+        }
+
+        @Override
+        public boolean needsInput() {
+            return delegate.needsInput();
+        }
+
+        @Override
+        public void addInput(Page page) {
+            if (page.getPositionCount() == 0) {
+                page.releaseBlocks();
+            } else {
+                delegate.addInput(page);
+            }
+        }
+
+        @Override
+        public Page getOutput() {
+            Page checked = delegate.getOutput();
+            if (checked != null) {
+                boolean retained = false;
+                try {
+                    pages = pages == null ? bigArrays.newObjectArray(1) : bigArrays.grow(pages, writePosition + 1);
+                    pages.set(writePosition++, checked);
+                    retained = true;
+                } finally {
+                    if (retained == false) {
+                        checked.releaseBlocks();
+                    }
+                }
+            }
+            if (delegate.isFinished() && readPosition < writePosition) {
+                Page result = pages.get(readPosition);
+                pages.set(readPosition++, null);
+                rowsEmitted += result.getPositionCount();
+                return result;
+            }
+            return null;
+        }
+
+        @Override
+        public void finish() {
+            delegate.finish();
+        }
+
+        @Override
+        public boolean isFinished() {
+            return delegate.isFinished() && readPosition == writePosition;
+        }
+
+        @Override
+        public boolean canProduceMoreDataWithoutExtraInput() {
+            return delegate.canProduceMoreDataWithoutExtraInput() || delegate.isFinished() && readPosition < writePosition;
+        }
+
+        @Override
+        public AbstractPageMappingOperator.Status status() {
+            var status = delegate.status();
+            return new AbstractPageMappingOperator.Status(
+                status.processNanos(),
+                status.pagesProcessed(),
+                status.rowsReceived(),
+                rowsEmitted
+            );
+        }
+
+        @Override
+        public void close() {
+            try {
+                while (readPosition < writePosition) {
+                    Page page = pages.get(readPosition);
+                    pages.set(readPosition++, null);
+                    page.releaseBlocks();
+                }
+            } finally {
+                Releasables.close(pages, delegate);
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "UniquenessGuard[" + delegate + "]";
+        }
     }
 
     private sealed interface Processor extends Releasable permits BytesRefProcessor, BytesRefFailOnDuplicateProcessor, IntOrdinalProcessor,

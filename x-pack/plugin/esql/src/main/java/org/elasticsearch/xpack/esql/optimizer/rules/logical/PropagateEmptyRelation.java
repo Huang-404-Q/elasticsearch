@@ -63,6 +63,10 @@ public class PropagateEmptyRelation extends OptimizerRules.ParameterizedOptimize
             }
             return PruneEmptyPlans.skipPlan(unary);
         }
+        if (plan instanceof Join join && join.eager()) {
+            // Materialize the build first, even with an empty probe, and retain the probe's validations for an empty build.
+            return plan;
+        }
         if (plan instanceof Join join && join.left() instanceof LocalRelation lr && lr.hasEmptySupplier()) {
             var type = join.config().type();
             if (type == JoinTypes.LEFT

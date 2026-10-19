@@ -8,26 +8,37 @@
 package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.common.logging.HeaderWarning;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
-import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.Values;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesUnset;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
+import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
-import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.PROMETHEUS_LABELS_PREFIX;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.isTsMetadata;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.labelName;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.supportTimeSeriesMetadataType;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.finite;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.open;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.project;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.subtract;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.union;
 
@@ -52,10 +63,7 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
     @Override
     public final List<Attribute> output() {
         if (output == null) {
-            output = child().output()
-                .stream()
-                .filter(attr -> MetadataAttribute.isTimeSeriesAttributeName(attr.name()) || LE_LABEL.equals(labelName(attr)) == false)
-                .toList();
+            output = child().output().stream().filter(attr -> isTsMetadata(attr) || LE_LABEL.equals(labelName(attr)) == false).toList();
         }
         return output;
     }
@@ -72,17 +80,12 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
         return true;
     }
 
-    private static String labelName(Attribute attribute) {
-        String fieldName;
-        if (attribute instanceof FieldAttribute fieldAttribute) {
-            fieldName = fieldAttribute.fieldName().string();
-        } else {
-            fieldName = attribute.name();
-        }
-        if (fieldName.startsWith(PROMETHEUS_LABELS_PREFIX)) {
-            return fieldName.substring(PROMETHEUS_LABELS_PREFIX.length());
-        }
-        return fieldName;
+    @Override
+    public Map<String, DataType> labelTypes() {
+        var types = new HashMap<>(PromqlPlan.labelTypes(child()));
+        types.remove(LE_LABEL);
+        types.remove(LabelMatcher.NAME);
+        return Map.copyOf(types);
     }
 
     @Override
@@ -92,7 +95,7 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
         List<String> le = List.of(HistogramFunctionCall.LE_LABEL);
         TranslationSchema childRequired = union(union(subtract(context.required(), le), open(le)), finite(le));
         IntermediateResult result = context.withRequired(childRequired).translate(child());
-        if (result.kind().constant) {
+        if (skipFunctionTranslation(context, result)) {
             return result;
         }
 
@@ -104,7 +107,15 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
         // Classic counter-backed histograms need the special treatment below.
         Attribute leColumn = result.label(HistogramFunctionCall.LE_LABEL);
         if (leColumn == null) {
-            // like prometheus, return warning and drop series w/o `le`
+            // Prometheus ignores float samples without a bucket bound. Preserve the legacy diagnostic only.
+            if (supportTimeSeriesMetadataType(context)) {
+                result = context.inlineConstantSteps(result);
+                if (result.kind().afterInitialAggregation == false) {
+                    result = context.collapse(result, result.schema(), result.value());
+                }
+                // Ignoring samples must still evaluate the argument, including duplicate-series checks below it.
+                return result.with(new Drain(source(), result.plan()), result.schema(), result.value());
+            }
             HeaderWarning.addWarning(functionName() + ": input vector has no le label; no buckets to evaluate");
             var skipAllFilter = new Filter(source(), result.plan(), Literal.FALSE);
             var nullGrouping = new Values(source(), new Literal(source(), null, DataType.DOUBLE));
@@ -121,6 +132,19 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
         }
 
         // Bucket counts are consumed as doubles; counter buckets are frequently integer/long typed, so cast explicitly.
+        if (supportTimeSeriesMetadataType(context)) {
+            var excluded = Set.of(LE_LABEL, LabelMatcher.NAME);
+            var metadataLabels = result.schema().labelsInMetadata(excluded);
+            LogicalPlan plan = result.plan();
+            if (metadataLabels.isEmpty() == false) {
+                var names = metadataLabels.stream().map(name -> (Expression) Literal.keyword(source(), name)).toList();
+                var metadata = new TimeSeriesUnset(source(), result.metadata(), names);
+                plan = new Eval(source(), plan, List.of(new Alias(source(), MetadataAttribute.TIMESERIES, metadata)));
+            }
+            var remaining = new LinkedHashSet<>(result.schema().labels());
+            remaining.removeAll(excluded);
+            result = result.with(plan, project(result.schema(), remaining), result.value());
+        }
         TranslationSchema schema = context.regroupWithout(result.schema(), le);
         Expression count = new ToDouble(source(), result.value());
         return context.regroup(result, schema, true, buildAggregateFunction(count, leColumn));

@@ -68,6 +68,7 @@ import org.elasticsearch.xpack.esql.expression.function.aggregate.VarianceOverTi
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.CompoundOutputEval;
 import org.elasticsearch.xpack.esql.plan.logical.Dedup;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.Drop;
 import org.elasticsearch.xpack.esql.plan.logical.Explain;
 import org.elasticsearch.xpack.esql.plan.logical.ExternalRelation;
@@ -75,6 +76,7 @@ import org.elasticsearch.xpack.esql.plan.logical.FillNull;
 import org.elasticsearch.xpack.esql.plan.logical.Highlight;
 import org.elasticsearch.xpack.esql.plan.logical.InlineStats;
 import org.elasticsearch.xpack.esql.plan.logical.Keep;
+import org.elasticsearch.xpack.esql.plan.logical.KeepMinimum;
 import org.elasticsearch.xpack.esql.plan.logical.LeafPlan;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Lookup;
@@ -102,6 +104,7 @@ import org.elasticsearch.xpack.esql.plan.logical.join.SemiJoin;
 import org.elasticsearch.xpack.esql.plan.logical.local.ResolvingProject;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesReduction;
+import org.elasticsearch.xpack.esql.plan.logical.promql.CheckSeriesUniqueness;
 import org.elasticsearch.xpack.esql.plan.logical.promql.HistogramFraction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.HistogramFunctionCall;
 import org.elasticsearch.xpack.esql.plan.logical.promql.HistogramQuantile;
@@ -170,6 +173,7 @@ public class ApproximationSupportTests extends ESTestCase {
         WithinSeriesAggregate.class,
         AcrossSeriesAggregate.class,
         AcrossSeriesReduction.class,
+        CheckSeriesUniqueness.class,
         HistogramFunctionCall.class,
         HistogramFraction.class,
         HistogramQuantile.class,
@@ -225,6 +229,8 @@ public class ApproximationSupportTests extends ESTestCase {
         SparklineGenerateEmptyBuckets.class,
 
         // internals
+        Drain.class,
+        KeepMinimum.class,
         PackDims.class,
         UnpackDims.class,
         TopNPreFilter.class

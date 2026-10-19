@@ -39,6 +39,7 @@ import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.In;
 import org.elasticsearch.xpack.esql.plan.logical.DocPreserving;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.ExecutesOn;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
@@ -54,6 +55,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -74,9 +76,15 @@ import static org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes.LEFT;
  * boolean mark attribute with three-valued logic.
  */
 public abstract class AbstractSubqueryJoin extends Join implements SortPreserving, ExecutesOn.Coordinator, DocPreserving {
+    private final boolean eager;
 
     protected AbstractSubqueryJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config) {
+        this(source, left, right, config, false);
+    }
+
+    protected AbstractSubqueryJoin(Source source, LogicalPlan left, LogicalPlan right, JoinConfig config, boolean eager) {
         super(source, left, right, config, ExecuteLocation.ANY);
+        this.eager = eager;
     }
 
     protected AbstractSubqueryJoin(
@@ -87,7 +95,35 @@ public abstract class AbstractSubqueryJoin extends Join implements SortPreservin
         List<Attribute> leftFields,
         List<Attribute> rightFields
     ) {
+        this(source, left, right, type, leftFields, rightFields, false);
+    }
+
+    protected AbstractSubqueryJoin(
+        Source source,
+        LogicalPlan left,
+        LogicalPlan right,
+        JoinType type,
+        List<Attribute> leftFields,
+        List<Attribute> rightFields,
+        boolean eager
+    ) {
         super(source, left, right, type, leftFields, rightFields, null, ExecuteLocation.ANY);
+        this.eager = eager;
+    }
+
+    @Override
+    public final boolean eager() {
+        return eager;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(super.hashCode(), eager);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return super.equals(other) && eager == ((AbstractSubqueryJoin) other).eager;
     }
 
     @Override
@@ -139,7 +175,7 @@ public abstract class AbstractSubqueryJoin extends Join implements SortPreservin
      * counts unchanged and emits {@code Eval($m = NULL)} when every right value is NULL.
      */
     protected LogicalPlan buildShortCircuitPlan(Source source, boolean allRightNull) {
-        return new LocalRelation(source, output(), EmptyLocalSupplier.EMPTY);
+        return eager ? new Drain(source, left()) : new LocalRelation(source, output(), EmptyLocalSupplier.EMPTY);
     }
 
     /**

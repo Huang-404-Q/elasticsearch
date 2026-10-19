@@ -10,7 +10,9 @@ package org.elasticsearch.xpack.esql.planner.mapper;
 import org.elasticsearch.compute.aggregation.AggregatorMode;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.xpack.esql.EsqlIllegalArgumentException;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
@@ -21,12 +23,14 @@ import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerat
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.BranchPlan;
+import org.elasticsearch.xpack.esql.plan.logical.Drain;
 import org.elasticsearch.xpack.esql.plan.logical.Enrich;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.ExecutesOn.ExecuteLocation;
 import org.elasticsearch.xpack.esql.plan.logical.ExternalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.Fork;
+import org.elasticsearch.xpack.esql.plan.logical.KeepMinimum;
 import org.elasticsearch.xpack.esql.plan.logical.LeafPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Limit;
 import org.elasticsearch.xpack.esql.plan.logical.LimitBy;
@@ -43,17 +47,21 @@ import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.Join;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinConfig;
 import org.elasticsearch.xpack.esql.plan.logical.join.JoinTypes;
+import org.elasticsearch.xpack.esql.plan.logical.promql.CheckSeriesUniqueness;
 import org.elasticsearch.xpack.esql.plan.physical.DistinctByExec;
+import org.elasticsearch.xpack.esql.plan.physical.EvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExchangeExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.HashJoinExec;
+import org.elasticsearch.xpack.esql.plan.physical.KeepMinimumExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitByExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.MergeExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
+import org.elasticsearch.xpack.esql.plan.physical.PackDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.TopNByExec;
@@ -152,6 +160,47 @@ public class Mapper {
         //
         // Pipeline breakers
         //
+        if (unary instanceof Drain drain) {
+            mappedChild = addExchangeForFragment(drain.child(), mappedChild);
+            // The coordinator optimizer does not prune physical filters; FALSE drains every input page.
+            return new FilterExec(drain.source(), mappedChild, Literal.FALSE);
+        }
+        if (unary instanceof KeepMinimum keep) {
+            mappedChild = addExchangeForFragment(keep.child(), mappedChild);
+            return new KeepMinimumExec(keep.source(), mappedChild, keep.key(), keep.priority());
+        }
+        if (unary instanceof CheckSeriesUniqueness check) {
+            // Exchange the child, not the check: uniqueness must cover rows from every data node.
+            mappedChild = addExchangeForFragment(check.child(), mappedChild);
+            Alias step = new Alias(
+                check.source(),
+                TemporaryNameGenerator.locallyUniqueTemporaryName("series_step"),
+                check.step(),
+                null,
+                true
+            );
+            Alias identity = new Alias(
+                check.source(),
+                TemporaryNameGenerator.locallyUniqueTemporaryName("series_identity"),
+                check.identity(),
+                null,
+                true
+            );
+            Attribute key = new ReferenceAttribute(
+                check.source(),
+                null,
+                TemporaryNameGenerator.locallyUniqueTemporaryName("series_key"),
+                DataType.SOURCE,
+                Nullability.FALSE,
+                null,
+                true
+            );
+            PhysicalPlan evaluated = new EvalExec(check.source(), mappedChild, List.of(step, identity));
+            PhysicalPlan keyed = new PackDimsExec(check.source(), evaluated, List.of(step.toAttribute(), identity.toAttribute()), key);
+            PhysicalPlan checked = new DistinctByExec(check.source(), keyed, key, true);
+            return new ProjectExec(check.source(), checked, check.output());
+        }
+
         if (unary instanceof Aggregate aggregate) {
             List<Attribute> intermediate = MapperUtils.intermediateAttributes(aggregate);
 

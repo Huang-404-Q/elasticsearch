@@ -9,26 +9,41 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xpack.esql.core.capabilities.Resolvables;
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.UnionTypeEsField;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToCounter;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToGauge;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesUnset;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionRegistry;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionRegistry.PromqlContext;
 import org.elasticsearch.xpack.esql.parser.ParsingException;
+import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
+
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.supportTimeSeriesMetadataType;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.open;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.union;
 
 /**
  * Represents a PromQL function call in the logical plan.
@@ -149,6 +164,14 @@ public abstract sealed class PromqlFunctionCall extends UnaryPlan implements Pro
     @Override
     public abstract boolean isIdentityTransparent();
 
+    /**
+     * Bypass a known-empty input in the generic lowering. Functions that synthesize rows from empty input need their
+     * own lowering. The legacy path also bypasses nonempty compile-time relations; the typed path evaluates them.
+     */
+    protected final boolean skipFunctionTranslation(TranslationContext context, IntermediateResult input) {
+        return input.kind() == IntermediateResult.Kind.EMPTY || (input.kind().constant && supportTimeSeriesMetadataType(context) == false);
+    }
+
     @Override
     public final PromqlDataType returnType() {
         return functionType().outputType;
@@ -161,7 +184,7 @@ public abstract sealed class PromqlFunctionCall extends UnaryPlan implements Pro
      */
     protected final IntermediateResult translateValueFunction(TranslationContext context) {
         IntermediateResult child = context.translate(child());
-        if (child.kind().constant) {
+        if (skipFunctionTranslation(context, child)) {
             return child;
         }
         Expression window = AggregateFunction.NO_WINDOW;
@@ -170,5 +193,69 @@ public abstract sealed class PromqlFunctionCall extends UnaryPlan implements Pro
         }
         var promqlCtx = new PromqlContext(context.time(), window, child.step(), context.configuration());
         return context.eval(child, buildEsqlFunction(child.value(), promqlCtx));
+    }
+
+    /**
+     * Value and range functions remove the metric name after evaluating each input series. Finish the original
+     * identity first: two series differing only by name must raise a duplicate-series error, never merge silently.
+     */
+    protected final IntermediateResult translateValueFunctionDroppingMetricName(TranslationContext context) {
+        if (supportTimeSeriesMetadataType(context) == false || metricNameMayBePresent(context) == false) {
+            return translateValueFunction(context);
+        }
+        TranslationContext fullIdentity = context.withRequired(union(context.required(), open()));
+        IntermediateResult result = translateValueFunction(fullIdentity);
+        if (result.kind() == IntermediateResult.Kind.EMPTY) {
+            return result;
+        }
+        result = fullIdentity.inlineConstantSteps(result);
+        if (result.kind().afterInitialAggregation == false) {
+            result = fullIdentity.collapse(result, result.schema(), result.value());
+        }
+        if (result.schema().isOpen() == false && result.schema().labels().contains(LabelMatcher.NAME) == false) {
+            return result;
+        }
+        var definitions = new ArrayList<Alias>();
+        var bindings = new HashMap<>(result.labelBindings());
+        Attribute name = result.labelColumn(LabelMatcher.NAME);
+        if (name != null) {
+            // Retain a declared finite column as null: null labels are absent, and the public output shape remains stable.
+            Alias absent = new Alias(source(), name.name(), new Literal(source(), null, name.dataType()));
+            definitions.add(absent);
+            bindings.put(LabelMatcher.NAME, absent.toAttribute());
+        } else {
+            definitions.add(
+                new Alias(
+                    source(),
+                    MetadataAttribute.TIMESERIES,
+                    new TimeSeriesUnset(source(), result.metadata(), List.of(Literal.keyword(source(), LabelMatcher.NAME)))
+                )
+            );
+        }
+        LogicalPlan plan = new Eval(source(), result.plan(), definitions);
+        return PromqlPlan.checkUnique(source(), result.with(plan, result.schema(), result.value(), bindings));
+    }
+
+    private boolean metricNameMayBePresent(TranslationContext context) {
+        if (child() instanceof Selector) {
+            // PROMQL requests all dimension fields from field-caps. A flattened field can hide individual keys,
+            // so only a fully resolved source without either NAME or flattened fields proves the name absent.
+            return context.cmd()
+                .child()
+                .output()
+                .stream()
+                .anyMatch(
+                    attribute -> attribute.resolved() == false
+                        || attribute instanceof FieldAttribute field
+                            && (LabelMatcher.NAME.equals(PromqlLabels.labelName(field))
+                                || field.dataType() == DataType.FLATTENED
+                                || field.dataType() == DataType.UNSUPPORTED
+                                || field.field() instanceof UnionTypeEsField)
+                );
+        }
+        if (PromqlLabels.hasTsMetadata(child().output()) == false) {
+            return child().output().stream().anyMatch(attribute -> LabelMatcher.NAME.equals(PromqlLabels.labelName(attribute)));
+        }
+        return true;
     }
 }

@@ -11,17 +11,21 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Represents a PromQL function call that performs element-wise transformations on an instant vector.
  * <p>
- * These functions transform each sample in the input instant vector independently, preserving the labels.
+ * These functions transform each sample in the input instant vector independently, preserving labels other than the metric name.
  * The result is an instant vector with the same cardinality as the input, containing the transformed values.
  * This corresponds to PromQL syntax:
  * <pre>
@@ -35,7 +39,7 @@ import java.util.List;
  * sqrt(variance)
  * </pre>
  *
- * These functions operate on the value of each time series without changing the set of series or their labels.
+ * Series that become indistinguishable after dropping the metric name are rejected by the typed translation.
  */
 public final class ValueTransformationFunction extends PromqlFunctionCall {
     public ValueTransformationFunction(Source source, LogicalPlan child, PromqlFunctionDefinition definition, List<Expression> parameters) {
@@ -58,6 +62,13 @@ public final class ValueTransformationFunction extends PromqlFunctionCall {
     }
 
     @Override
+    public Map<String, DataType> labelTypes() {
+        var types = new HashMap<>(PromqlPlan.labelTypes(child()));
+        types.remove(LabelMatcher.NAME);
+        return Map.copyOf(types);
+    }
+
+    @Override
     public FunctionType functionType() {
         return FunctionType.VALUE_TRANSFORMATION;
     }
@@ -69,6 +80,6 @@ public final class ValueTransformationFunction extends PromqlFunctionCall {
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateValueFunction(context);
+        return translateValueFunctionDroppingMetricName(context);
     }
 }

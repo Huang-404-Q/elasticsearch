@@ -142,7 +142,13 @@ public class LogicalPlanOptimizer extends ParameterizedRuleExecutor<LogicalPlan,
             // projection the query already had. operators() has converged by now, so combine them here.
             new CombineProjections()
         ),
-        new Batch<>("Skip Compute", new SkipQueryOnLimitZero(), new AddTopNPreFilterToAggregate()),
+        new Batch<>(
+            "Skip Compute",
+            new SkipQueryOnLimitZero(),
+            // A zero limit can introduce a Drain after operator optimization has already pruned redundant sorts.
+            new PruneRedundantOrderBy(),
+            new AddTopNPreFilterToAggregate()
+        ),
         cleanup(),
         warnings(),
         new Batch<>("Set as Optimized", Limiter.ONCE, new SetAsOptimized())

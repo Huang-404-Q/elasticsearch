@@ -9,12 +9,15 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.type.EsField;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.finite;
@@ -85,16 +88,28 @@ public class TranslationContextTests extends ESTestCase {
         assertThat(TranslationContext.mapOpen(Set.of("pod", "region")), equalTo(TranslationContext.mapOpen(Set.of("region", "pod"))));
     }
 
+    /** Derived names stay literal, while legacy canonical lookups continue to prefer their passthrough backing fields. */
     public void testFindByNameMatchesCanonicalNamesAndPrefersPassthroughFields() {
         Attribute bare = attr("cluster");
         Attribute prefixed = new ReferenceAttribute(Source.EMPTY, "labels.cluster", DataType.KEYWORD);
+        Attribute mapped = new FieldAttribute(
+            Source.EMPTY,
+            null,
+            null,
+            "labels.cluster",
+            new EsField("labels.cluster", DataType.KEYWORD, Map.of(), true, EsField.TimeSeriesFieldType.DIMENSION)
+        );
         Attribute packed = attr(TranslationContext.mapOpen(Set.of("pod")));
 
         assertThat(TranslationContext.find(List.of(bare, prefixed), "cluster"), sameInstance(prefixed));
+        assertThat(TranslationContext.find(List.of(bare, prefixed), "labels.cluster"), sameInstance(prefixed));
+        assertThat(TranslationContext.find(List.of(bare, mapped), "cluster"), sameInstance(mapped));
+        assertThat(TranslationContext.find(List.of(mapped, bare), "cluster"), sameInstance(mapped));
         assertThat(TranslationContext.find(List.of(bare), "cluster"), sameInstance(bare));
         assertThat(TranslationContext.find(List.of(bare, packed), TranslationContext.mapOpen(Set.of("pod"))), sameInstance(packed));
         assertNull(TranslationContext.find(List.of(bare), "pod"));
-        assertThat(TranslationContext.mapFinite(List.of(bare, prefixed, attr("pod"))), contains("cluster", "pod"));
+        assertThat(PromqlLabels.labelNames(List.of(bare, prefixed, attr("pod"))), contains("cluster", "labels.cluster", "pod"));
+        assertThat(PromqlLabels.labelNames(List.of(bare, mapped, attr("pod"))), contains("cluster", "pod"));
     }
 
     private static Attribute attr(String name) {
